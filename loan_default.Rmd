@@ -1,0 +1,986 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+-	Anomaly detection – can you identify and explain 5-10 anomalous records
+o	Use Isolation Forest 
+
+-	Minimum of 3 different models (minimum: logistic, neural network, gradient boosting) 
+trained, 
+tuned, and compared 
+
+-	Global explanations of your **best model**: 
+o	Variable importance using ViP for **best model**
+o	Partial dependency plot of top variables **best model**
+
+- Local Explanations
+	Use SHAP method  https://modeloriented.github.io/DALEX/
+o	TP – top 10 true positives, loan default = 1 and ordered by pred_1 score DECENDING
+o	FP – top 10 false positives, loan default = 0 and ordered by pred_1 score DECENDING (high scoring but actually didn’t default) 
+o	FN - top 10 true negatives, loan default = 1 and ordered by pred_1 score ASCENDING   (low scoring that did default) 
+
+
+
+##  Import Libraries
+
+```{r,warning=FALSE,message=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(vip)
+library(solitude) 
+library(janitor)
+library(ggpubr)
+library(DALEX)
+library(DALEXtra)
+library(NeuralNetTools)
+```
+
+```{r,warning=FALSE,message=FALSE}
+loan_df <- read_csv("./data/loan_train.csv")
+loan_df %>% head()
+```
+
+```{r}
+loan_df <- loan_df %>%
+  mutate_if(is.character,as.factor) %>%
+  mutate(loan_status = factor(loan_status)) 
+
+
+loan_df %>%
+  count(loan_status)
+```
+
+## Train Test Split 
+
+```{r}
+set.seed(42)
+
+train_test_spit<- initial_split(loan_df, prop = 0.7, strata=loan_status)
+
+train <- training(train_test_spit)
+test  <- testing(train_test_spit)
+
+
+sprintf("Train PCT : %1.2f%%", nrow(train)/ nrow(loan_df) * 100)
+sprintf("Test  PCT : %1.2f%%", nrow(test)/ nrow(loan_df) * 100)
+
+```
+
+# Model building
+
+## Model evaluation strategy
+
+```{r}
+# score_train <- bind_cols(
+#   predict(rf_workflow_fit,train, type="prob"), 
+#   predict(rf_workflow_fit,train, type="class"),
+#   train) %>% 
+#   mutate(part = "train") 
+# 
+# score_train
+# 
+# options(yardstick.event_first = FALSE)
+# score_train %>%
+#   metrics(loan_status,.pred_default, estimate=.pred_class)
+
+
+#function to predict given model and threshold
+predict_set <- function(workflow_fit, dataset, threshold = 0.5){
+  scored <- predict(workflow_fit, dataset, type="prob") %>% 
+    mutate(.pred_class = as.factor(ifelse(.pred_default>=threshold, "default","current"))) %>% 
+    bind_cols(.,dataset)
+  return(scored)}
+
+
+#function to evaluate model and compute model gain
+evaluate_set <- function(scored_data, model_name, datasplit = "training", event_label = "loan_status", event_level="second"){
+  
+  multi_metric <- metric_set(accuracy, precision, recall, mn_log_loss, specificity , roc_auc)
+  scored_data %>% 
+    multi_metric(truth = !!as.name(event_label), 
+            predicted = .pred_default, 
+            estimate = .pred_class,
+            event_level = event_level) %>%
+    mutate(datasplit=datasplit,
+           model_name = model_name, 
+           .estimate = round(.estimate, 4)) %>%  
+    pivot_wider(names_from = .metric, values_from=.estimate) %>% 
+    mutate(fpr = 1- specificity) -> eval
+return(eval)}
+```
+
+
+## Receipe
+```{r}
+
+#recipe
+loan_recipe <- recipe(loan_status ~ loan_amnt + funded_amnt +  grade + sub_grade + annual_inc,
+                    data = train)%>%
+  step_impute_median(all_numeric_predictors())  %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+  #step_novel(all_nominal_predictors()) %>%
+  #step_other(neighborhood, threshold = .1)  %>% 
+  #step_nzv(all_predictors())# %>% 
+  #themis::step_downsample(event_label, under_ratio = 3)
+
+```
+
+
+## Logistic Model
+
+### Model specification
+
+```{r}
+#Model specification
+log_spec <- logistic_reg() %>%
+  set_mode("classification") %>%
+  set_engine("glm")
+#Model workflow
+log_workflow <- workflow() %>%
+  add_recipe(loan_recipe) %>%
+  add_model(log_spec) %>%
+  fit(train)
+## -- check out your parameter estimates ...
+metrics <- tidy(log_workflow) %>%
+  mutate_at(c("estimate", "std.error", "statistic", "p.value"),round, 4)
+
+metrics
+```
+
+### Logistic Model - Evaluation
+
+```{r}
+scored_train_log <- predict_set(workflow_fit = log_workflow,
+                                dataset = train,
+                                threshold = 0.5)
+scored_train_log
+
+eval_metrics_train_log <- evaluate_set(scored_data = scored_train_log, 
+                                       model_name = "logistic", 
+                                       datasplit = "training",
+                                       event_label = "loan_status",
+                                       event_level = "second")
+
+scored_test_log <- predict_set(workflow_fit = log_workflow,
+                               dataset = test,
+                               threshold = 0.5)
+scored_test_log
+
+eval_metrics_test_log <- evaluate_set(scored_data = scored_test_log, 
+                                      model_name = "logistic", 
+                                      datasplit = "testing",
+                                      event_label = "loan_status",
+                                      event_level = "second")
+
+eval_metrics_log <- eval_metrics_train_log %>% bind_rows(eval_metrics_test_log)
+eval_metrics_log
+```
+
+
+## Random Forest - Tuned
+
+### Model specification
+
+```{r}
+set.seed(456)
+rf_tune_spec <- rand_forest(
+  mtry = tune(),
+  trees = 500,
+  min_n = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "permutation", max.depth = 15)
+
+#workflow
+rf_tune_wf <- workflow() %>%
+  add_recipe(loan_recipe) %>%
+  add_model(rf_tune_spec)
+
+#vfold samples
+set.seed(234)
+trees_folds <- vfold_cv(train, v = 3)
+
+#enable parallel processing
+doParallel::registerDoParallel(cores = 3)
+
+#set up grid  
+set.seed(456)
+rf_grid <- grid_random(
+  mtry(range(5,12)),
+  min_n(),
+  size = 10)
+
+rf_grid
+
+#metric set
+tune_metric <- metric_set(roc_auc)
+
+
+#tune
+set.seed(456)
+regular_res <- tune_grid(
+  rf_tune_wf,
+  resamples = trees_folds,
+  grid = rf_grid,
+  metrics = tune_metric
+)
+
+regular_res
+
+#view metrics
+regular_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  mutate(min_n = factor(min_n)) %>%
+  ggplot(aes(mtry, mean, color = min_n)) +
+  geom_line(alpha = 0.5, size = 1.5) +
+  geom_point() +
+  labs(y = "AUC")
+
+
+#select best parameters
+best_auc <- select_best(regular_res, "roc_auc")
+
+#select best model
+final_rf <- finalize_model(
+  rf_tune_spec,
+  best_auc
+)
+
+final_rf
+
+#final workflow
+final_rf_wf_tuned <- workflow() %>%
+  add_recipe(loan_recipe) %>%
+  add_model(final_rf) %>% 
+  fit(train)
+  
+
+
+saveRDS(final_rf_wf_tuned, "./final_rf_wf_tuned.rds")
+
+#Variable Importance
+final_rf_wf_tuned %>%
+  extract_fit_parsnip() %>%
+  vip(30)
+
+# # -- RF model & workflow 
+# rf_model <- rand_forest(
+#   trees = 100, ) %>% 
+#   set_engine("ranger",num.threads = 8, importance = "permutation") %>% 
+#   set_mode("classification" )
+# 
+# rf_workflow_fit <- workflow() %>%
+#   add_recipe(rf_recipe) %>%
+#   add_model(rf_model) %>% 
+#   fit(train)
+
+```
+
+### Random Forest Tuned - Evaluation
+
+```{r}
+#rf_wf <- readRDS("./rand_forest_final_tune.rds")
+scored_train_rf_tuned <- predict_set(final_rf_wf_tuned, train)
+scored_test_rf_tuned <- predict_set(final_rf_wf_tuned, test)
+
+# write_csv(scored_train_rf, "./results/scored_train_rf.csv")
+# write_csv(scored_test_rf, "./results/scored_test_rf.csv")
+
+eval_metrics_train_rf_tuned <- evaluate_set(scored_data = scored_train_rf_tuned, 
+                                            model_name = "Random forest - tuned", 
+                                            datasplit = "training",
+                                            event_label = "loan_status",
+                                            event_level = "second")
+eval_metrics_test_rf_tuned <- evaluate_set(scored_data = scored_test_rf_tuned, 
+                                           model_name = "Random forest - tuned", 
+                                           datasplit = "testing",
+                                           event_label = "loan_status",
+                                           event_level = "second")
+
+eval_metrics_rf_tune <- eval_metrics_train_rf_tuned %>% 
+  bind_rows(eval_metrics_test_rf_tuned)
+eval_metrics_rf_tune
+```
+
+## RF MODEL SCORING
+```{r}
+score_train <- bind_cols(
+  predict(rf_workflow_fit,train, type="prob"), 
+  predict(rf_workflow_fit,train, type="class"),
+  train) %>% 
+  mutate(part = "train") 
+
+score_train
+
+options(yardstick.event_first = FALSE)
+score_train %>%
+  metrics(loan_status,.pred_default, estimate=.pred_class)
+```
+
+
+## XGBoost - Tuned
+
+### Model specification
+
+```{r}
+set.seed(456)
+xgb_tune_spec <- boost_tree(trees=tune(), 
+                        learn_rate = tune(),
+                        tree_depth = tune()) %>%
+  set_engine("xgboost", importance="permutation") %>%
+  set_mode("classification")
+
+#workflow
+xgb_tune_wf <- workflow() %>%
+  add_recipe(loan_recipe) %>%
+  add_model(xgb_tune_spec)
+
+#vfold samples
+set.seed(234)
+trees_folds <- vfold_cv(train, v = 3)
+
+#enable parallel processing
+doParallel::registerDoParallel(cores = 3)
+
+#set up grid  
+# set.seed(456)
+# rf_grid <- grid_random(
+#   mtry(range(5,12)),
+#   min_n(),
+#   size = 10)
+# 
+# rf_grid
+
+#metric set
+tune_metric <- metric_set(roc_auc)
+
+#tune
+set.seed(456)
+xgb_tuned <- tune_bayes(
+  xgb_tune_wf,
+  resamples = trees_folds,
+  metrics = tune_metric,
+  # Generate five at semi-random to start
+  initial = 5,
+  iter = 2, 
+  # How to measure performance?
+  control = control_bayes(no_improve = 5, verbose = TRUE)
+)
+
+xgb_tuned
+
+#select best parameters
+best_auc <- select_best(xgb_tuned, "roc_auc")
+
+#select best model
+final_xgb <- finalize_model(
+  xgb_tune_spec,
+  best_auc
+)
+
+final_xgb
+
+#final workflow
+final_xgb_tuned <- workflow() %>%
+  add_recipe(loan_recipe) %>%
+  add_model(final_xgb) %>% 
+  fit(train)
+  
+
+
+saveRDS(final_xgb_tuned, "./final_xgb_tuned.rds")
+
+#Variable Importance
+final_xgb_tuned %>%
+  extract_fit_parsnip() %>%
+  vip(30)
+
+# # -- RF model & workflow 
+# rf_model <- rand_forest(
+#   trees = 100, ) %>% 
+#   set_engine("ranger",num.threads = 8, importance = "permutation") %>% 
+#   set_mode("classification" )
+# 
+# rf_workflow_fit <- workflow() %>%
+#   add_recipe(rf_recipe) %>%
+#   add_model(rf_model) %>% 
+#   fit(train)
+
+```
+
+```{r}
+xgb_tuned %>%  collect_metrics() %>% 
+  filter(.metric == "roc_auc")
+
+xgb_tuned %>%
+  collect_metrics() %>%
+  ggplot(aes(learn_rate, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+
+
+xgb_stuned %>%
+  collect_metrics() %>%
+  ggplot(aes(trees, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+```
+
+
+## Final Fit RF and XGB
+```{r}
+lowest_rf_rmse <- rf_grid_search %>%
+  select_best("rmse")
+
+rf_final <- finalize_workflow(
+  rf_wflow, lowest_rf_rmse
+) %>% 
+  fit(train)
+
+lowest_xgb_rmse <- search_res %>%
+  select_best("rmse")
+
+xgb_final <- finalize_workflow(
+  xgb_wflow, lowest_xgb_rmse
+) %>% 
+  fit(train)
+```
+
+
+
+### XGBoost Tuned - Evaluation
+
+```{r}
+#rf_wf <- readRDS("./rand_forest_final_tune.rds")
+scored_train_rf_tuned <- predict_set(final_rf_wf_tuned, train)
+scored_test_rf_tuned <- predict_set(final_rf_wf_tuned, test)
+
+# write_csv(scored_train_rf, "./results/scored_train_rf.csv")
+# write_csv(scored_test_rf, "./results/scored_test_rf.csv")
+
+eval_metrics_train_rf_tuned <- evaluate_set(scored_data = scored_train_rf_tuned, 
+                                            model_name = "Random forest - tuned", 
+                                            datasplit = "training",
+                                            event_label = "loan_status",
+                                            event_level = "second")
+eval_metrics_test_rf_tuned <- evaluate_set(scored_data = scored_test_rf_tuned, 
+                                           model_name = "Random forest - tuned", 
+                                           datasplit = "testing",
+                                           event_label = "loan_status",
+                                           event_level = "second")
+
+eval_metrics_rf_tune <- eval_metrics_train_rf_tuned %>% 
+  bind_rows(eval_metrics_test_rf_tuned)
+eval_metrics_rf_tune
+```
+
+
+## Neural Nets - Tuned
+
+### Model specification
+
+```{r}
+
+#recipe for neueral nets
+loan_recipe_mlp <- recipe(loan_status ~ loan_amnt + funded_amnt +  grade + sub_grade + annual_inc,
+                    data = train)%>%
+  step_impute_median(all_numeric_predictors())  %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  #step_other(neighborhood, threshold = .1)  %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  step_scal(all_predictors()) %>% 
+  step_nzv(all_predictors())# %>% 
+ # themis::step_downsample(event_label, under_ratio = 3)
+
+# -- there are lots of weights to deal with.
+loan_mlp <- mlp(epochs = 12) %>%
+  set_engine("nnet", MaxNWts=10245) %>%
+  set_mode("classification") 
+
+# -- fit the 
+mlp_wf <- workflow() %>%
+  add_recipe(loan_recipe_mlp) %>%
+  add_model(loan_mlp) %>%
+  fit(train)
+
+
+
+
+# set.seed(456)
+# rf_tune_spec <- rand_forest(
+#   mtry = tune(),
+#   trees = 500,
+#   min_n = tune()) %>%
+#   set_mode("classification") %>%
+#   set_engine("ranger", importance = "permutation", max.depth = 15)
+# 
+# #workflow
+# rf_tune_wf <- workflow() %>%
+#   add_recipe(loan_recipe) %>%
+#   add_model(rf_tune_spec)
+# 
+# #vfold samples
+# set.seed(234)
+# trees_folds <- vfold_cv(train, v = 3)
+# 
+# #enable parallel processing
+# doParallel::registerDoParallel(cores = 3)
+# 
+# #set up grid  
+# set.seed(456)
+# rf_grid <- grid_random(
+#   mtry(range(5,12)),
+#   min_n(),
+#   size = 10)
+# 
+# rf_grid
+# 
+# #metric set
+# tune_metric <- metric_set(roc_auc)
+# 
+# 
+# #tune
+# set.seed(456)
+# regular_res <- tune_grid(
+#   rf_tune_wf,
+#   resamples = trees_folds,
+#   grid = rf_grid,
+#   metrics = tune_metric
+# )
+# 
+# regular_res
+# 
+# #view metrics
+# regular_res %>%
+#   collect_metrics() %>%
+#   filter(.metric == "roc_auc") %>%
+#   mutate(min_n = factor(min_n)) %>%
+#   ggplot(aes(mtry, mean, color = min_n)) +
+#   geom_line(alpha = 0.5, size = 1.5) +
+#   geom_point() +
+#   labs(y = "AUC")
+# 
+# 
+# #select best parameters
+# best_auc <- select_best(regular_res, "roc_auc")
+# 
+# #select best model
+# final_rf <- finalize_model(
+#   rf_tune_spec,
+#   best_auc
+# )
+# 
+# final_rf
+# 
+# #final workflow
+# final_rf_wf_tuned <- workflow() %>%
+#   add_recipe(loan_recipe) %>%
+#   add_model(final_rf) %>% 
+#   fit(train)
+#   
+# 
+# 
+# saveRDS(final_rf_wf_tuned, "./final_rf_wf_tuned.rds")
+
+#Variable Importance
+visualize_network <- function(nn_workflow){
+  # extract model and plot 
+  mod1 <- nn_workflow$fit$fit$fit
+  plotnet(mod1) 
+
+}
+
+visualize_network(mlp_wf)
+
+# # -- RF model & workflow 
+# rf_model <- rand_forest(
+#   trees = 100, ) %>% 
+#   set_engine("ranger",num.threads = 8, importance = "permutation") %>% 
+#   set_mode("classification" )
+# 
+# rf_workflow_fit <- workflow() %>%
+#   add_recipe(rf_recipe) %>%
+#   add_model(rf_model) %>% 
+#   fit(train)
+
+```
+
+### Neural Nets - Evaluation
+
+```{r}
+#rf_wf <- readRDS("./rand_forest_final_tune.rds")
+scored_train_rf_tuned <- predict_set(final_rf_wf_tuned, train)
+scored_test_rf_tuned <- predict_set(final_rf_wf_tuned, test)
+
+# write_csv(scored_train_rf, "./results/scored_train_rf.csv")
+# write_csv(scored_test_rf, "./results/scored_test_rf.csv")
+
+eval_metrics_train_rf_tuned <- evaluate_set(scored_data = scored_train_rf_tuned, 
+                                            model_name = "Random forest - tuned", 
+                                            datasplit = "training",
+                                            event_label = "loan_status",
+                                            event_level = "second")
+eval_metrics_test_rf_tuned <- evaluate_set(scored_data = scored_test_rf_tuned, 
+                                           model_name = "Random forest - tuned", 
+                                           datasplit = "testing",
+                                           event_label = "loan_status",
+                                           event_level = "second")
+
+eval_metrics_rf_tune <- eval_metrics_train_rf_tuned %>% 
+  bind_rows(eval_metrics_test_rf_tuned)
+eval_metrics_rf_tune
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+rf_workflow_fit <- final_rf_wf_tuned
+rf_workflow_fit %>% 
+  pull_workflow_fit() %>%
+  vip(10)
+
+rf_explainer <- explain_tidymodels(
+  rf_workflow_fit,
+  data = train ,
+  y = train$loan_default ,
+  verbose = TRUE
+)
+
+pdp_grade <- model_profile(
+  rf_explainer,
+  variables = c("grade")
+)
+
+
+plot(pdp_grade) + 
+  labs(title = "PDP loan GRADE", 
+       x="grade", 
+       y="average impact on prediction") 
+  
+  
+as_tibble(pdp_grade$agr_profiles) %>%
+  mutate(profile_variable = `_x_`,
+         avg_prediction_impact = `_yhat_`) %>%
+  ggplot(aes(x=profile_variable, y=avg_prediction_impact)) +
+  geom_col() +
+  labs(
+    x = "Variable: Loan GRADE",
+     y = " Average prediction Impact ",
+    color = NULL,
+    title = "Partial dependence plot Loan GRADE",
+    subtitle = "How does GRADE impact predictions (on average)"
+  ) 
+
+```
+
+
+
+```{r}
+rf_explainer <- explain_tidymodels(
+  rf_workflow_fit,
+  data = train ,
+  y = train$loan_status ,
+  verbose = TRUE
+)
+
+pdp_age <- model_profile(
+  rf_explainer,
+  variables = "annual_inc"
+)
+
+
+pdp_age <- model_profile(
+  rf_explainer,
+  variables = "annual_inc"
+)
+
+plot(pdp_age)
+  labs(title = "PDP annual_inc", x="annual_inc", y="average impact on prediction") 
+```
+
+
+## Prediction Explainer 
+
+```{r}
+# speed things up! 
+train_sample <- train %>% 
+  select(loan_status, # select just the columns used 
+         loan_amnt ,
+         funded_amnt,
+         grade,
+         sub_grade,
+        annual_inc) %>%
+  sample_frac(0.1) # take a 10% sample or less
+
+rf_explainer <- explain_tidymodels(
+  rf_workflow_fit,
+  data = train_sample ,
+  y = train_sample$loan_status ,
+  verbose = TRUE
+)
+
+# you should use TEST not training for this! 
+score_train %>% head()
+
+# Top 5 TP highest scoring defaults 
+top_5_tp <- score_train %>%
+  filter(.pred_class == loan_status) %>%
+  filter(loan_status == "default") %>%
+  slice_max(order_by = .pred_default, n=5)
+
+# Top 5 FP highest scoring defaults 
+top_5_fp <- score_train %>%
+  filter(.pred_class == loan_status) %>%
+  filter(loan_status != "default") %>%
+  slice_max(order_by = .pred_default, n=5)
+
+# Bottom 5 FN lowest scoring defaults 
+bottom_5_fn <- score_train %>%
+  filter(.pred_class == loan_status) %>%
+  filter(loan_status == "default") %>%
+  slice_min(order_by = .pred_default, n=5)
+
+
+```
+
+## Local Explainer 
+
+```{r}
+
+
+explain_prediction <- function(single_record){
+# step 1. run the explainer 
+record_shap <- predict_parts(explainer = rf_explainer, 
+                               new_observation = single_record,
+                               type="shap")
+
+# step 2. get a predicted probability for plot 
+prediction_prob <- single_record[,".pred_default"] %>% 
+  mutate(.pred_default = round(.pred_default,3)) %>% 
+  pull() 
+
+# step 3. plot it. 
+# you notice you don't get categorical values ...  
+record_shap %>% 
+  plot() +
+  labs(title=paste("SHAP Explainer:",prediction_prob),
+       x = "shap importance",
+       y = "record") -> shap_plot 
+
+print(shap_plot)
+}
+
+# example TP 5 records
+for (row in 1:nrow(top_5_tp)) {
+    s_record <- top_5_tp[row,]
+    explain_prediction(s_record)
+} 
+```
+
+
+
+
+## --- ISOFOR ----
+-	Anomaly detection – 
+can you identify and explain 5-10 anomalous records - Use Isolation Forest
+```{r}
+# make a recipe 
+iso_recipe <- recipe(~ fico_range_low + 
+                       fico_range_high +
+                       open_acc + installment + funded_amnt
+                       , train) %>% 
+  step_impute_mean(all_predictors()) %>% 
+  prep()
+
+# bake it
+iso_prep <- bake(iso_recipe, train)
+
+# init a isoforest 
+iso_forest <- isolationForest$new(
+  sample_size = 2048,
+  num_trees = 100,
+  max_depth = 12)
+# fit
+iso_forest$fit(iso_prep)
+# predict
+pred_train <- iso_forest$predict(iso_prep)
+#sumarize
+pred_train %>%
+  summarise(n=n(),
+            min = min(average_depth),
+            max = max(average_depth),
+            mean = mean(average_depth),
+            min_score =  min(anomaly_score),
+            max_score = max(anomaly_score),
+            mean_score= mean(anomaly_score),
+    
+  )
+# pl0t
+pred_train %>%
+  ggplot(aes(average_depth)) +
+  geom_histogram(bins=20) + 
+  geom_vline(xintercept = 10, linetype="dotted", 
+                color = "blue", size=1.5) + 
+  labs(title="Isolation Forest Average Tree Depth")
+# plot
+pred_train %>%
+  ggplot(aes(anomaly_score)) +
+  geom_histogram(bins=20) + 
+  geom_vline(xintercept = 0.7, linetype="dotted", 
+                color = "blue", size=1.5) + 
+  labs(title="Isolation Forest Anomaly Score Above 0.7")
+
+# Who is anomalous?
+bind_cols(pred_train, train) %>% 
+  filter(anomaly_score>0.7) 
+
+# make a surrogate model 
+synth_train <- bind_cols(pred_train, iso_prep) %>%
+  mutate(synthetic_target = as.factor(
+           if_else(anomaly_score >= 0.7,"default","current"))
+         ) %>%
+  select(-average_depth, -anomaly_score, -id)
+
+synth_train
+# fit a model 
+fmla <- as.formula(paste("synthetic_target ~ ", paste(synth_train %>% colnames(), collapse= "+")))
+
+outlier_tree <- decision_tree(min_n=2, tree_depth=3, cost_complexity = .01) %>%
+  set_mode("classification") %>%
+  set_engine("rpart") %>%
+  fit(fmla, data=synth_train)
+
+outlier_tree$fit
+```
+
+# Global Anomaly Rules 
+
+eyeball what makes an anomaly
+
+```{r}
+library(rpart.plot)
+library(rpart)
+anomaly_rules <- rpart.rules(outlier_tree$fit,roundint=FALSE, extra = 4, cover = TRUE, clip.facs = TRUE) %>% clean_names() %>%
+  #filter(anomaly=="Anomaly") %>%
+  mutate(rule = "IF") 
+
+
+rule_cols <- anomaly_rules %>% select(starts_with("x_")) %>% colnames()
+
+for (col in rule_cols){
+anomaly_rules <- anomaly_rules %>%
+    mutate(rule = paste(rule, !!as.name(col)))
+}
+
+anomaly_rules %>%
+  as.data.frame() %>%
+  filter(synthetic_target != "current") %>%
+  mutate(rule = paste(rule, " THEN ", synthetic_target )) %>%
+  mutate(rule = paste(rule," coverage ", cover)) %>%
+  select( rule)
+
+anomaly_rules %>%
+  as.data.frame() %>%
+  filter(synthetic_target == "current") %>%
+  mutate(rule = paste(rule, " THEN ", synthetic_target )) %>%
+  mutate(rule = paste(rule," coverage ", cover)) %>%
+  select( rule)
+
+train %>% 
+  filter(installment >= 952 & funded_amnt >= 30263  )
+
+```
+## explain 5 anomalies 
+
+```{r}
+
+# Who is anomalous?
+pred_train <- iso_forest$predict(iso_prep)
+pred_train <- bind_cols(pred_train, iso_prep) %>%
+  mutate(synthetic_target = as.factor(
+           if_else(anomaly_score >= 0.7,"default","current"))
+         ) 
+
+
+local_explainer <- function(ID){
+  
+  fmla <- as.formula(paste("anomaly ~ ", paste(iso_prep %>% colnames(), collapse= "+")))
+  
+  pred_train %>%
+    mutate(anomaly= as.factor(if_else(id==ID, "Anomaly", "Normal"))) -> local_df
+  
+  local_tree <-  decision_tree(mode="classification",
+                              tree_depth = 3,
+                              min_n = 1,
+                              cost_complexity=0) %>%
+                set_engine("rpart") %>%
+                    fit(fmla,local_df )
+  
+  local_tree$fit
+  
+  #rpart.rules(local_tree$fit, extra = 4, cover = TRUE, clip.facs = TRUE)
+  rpart.plot(local_tree$fit, roundint=FALSE, extra=3) %>% print()
+  
+  anomaly_rules <- rpart.rules(local_tree$fit, extra = 4, cover = TRUE, clip.facs = TRUE) %>% clean_names() %>%
+    filter(anomaly=="Anomaly") %>%
+    mutate(rule = "IF") 
+  
+  
+  rule_cols <- anomaly_rules %>% select(starts_with("x_")) %>% colnames()
+  
+  for (col in rule_cols){
+  anomaly_rules <- anomaly_rules %>%
+      mutate(rule = paste(rule, !!as.name(col)))
+  }
+  
+  as.data.frame(anomaly_rules) %>%
+    select(rule, cover) %>%
+    print()
+}
+
+pred_train %>%
+  slice_max(order_by=anomaly_score,n=5) %>%
+  pull(id) -> anomaly_vect
+
+for (anomaly_id in anomaly_vect){
+  local_explainer(anomaly_id)
+}
+```
+
