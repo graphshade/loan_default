@@ -10,13 +10,13 @@ In this project, I attempted to use machine learning to help So & So Lending Clu
 <h2>Languages and Libraries Used</h2>
 
 - R programming language 
-- [List of libraries](https://github.com/graphshade/Customer-segmentation---R-Shiny-App/blob/master/renv.lock)
+- [List of libraries](https://github.com/graphshade/loan_default/blob/main/renv.lock)
 
 <h2>Environment Used </h2>
 
 - <b>Ubuntu 22.04.1 LTS</b>
 
-<h2>Program walk-through:</h2>
+<h2>Reproducing the Analysis:</h2>
 
 <p align="left">
 
@@ -32,25 +32,7 @@ In this project, I attempted to use machine learning to help So & So Lending Clu
    
    You may install the libraries directly on your computer however, using the virtual environment library `renv`. [Follow this guide to install renv](https://www.youtube.com/watch?v=yc7ZB4F_dc0)
    1. Open the app.R file in RStudio
-   2. In the RStudio console run `renv::init()` to initiate the renv virtual environment and install the required libraries from the [renv.lock](https://github.com/graphshade/Customer-segmentation---R-Shiny-App/blob/master/renv.lock) file 
+   2. In the RStudio console run `renv::init()` to initiate the renv virtual environment and install the required libraries from the [renv.lock](https://github.com/graphshade/loan_default/blob/main/renv.lock) file 
 
-4. Run the app
- From the left corner of your RStudio, click on <kbd> <br> Run App
- 
-   When the app run properly, you'll see
 
-   <img src="https://i.imgur.com/tLHZa7K.png" />
-
- 5. Following the instructions from the left panel, you may upload the `sample_dataset.csv` file
- 
- 6. After uploading the dataset, you can use tha tabs in the right panel to view the results
- 
-    <b>Customer Segmentation Results Tab</b>
- 
-    <img src="https://i.imgur.com/GI53Iel.png" />
- 
-    <b>Cluster Visualization Tab</b>
- 
-    <img src="https://i.imgur.com/5CD2fij.png" />
- </p>
  
