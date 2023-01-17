@@ -1,6 +1,6 @@
 # Loan Default Prediction
 
-<img src="https://i.imgur.com/pWBEwXX.png" />
+![](https://i.imgur.com/pWBEwXX.png)
 
 <h2>Problem statement</h2>
 Over the years, So & So Lending Club has been experiencing increase in the dollar amount of loan defaults. The chart above shows the gravity of the problem the company face. As of 2013, the total loan portfolio amounted to $182 million and $30.4 million of that is in default. The situation is getting worse, and requires drastic measures to reverse the trend. 
